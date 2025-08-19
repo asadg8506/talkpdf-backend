@@ -1,0 +1,6 @@
+flask
+python-dotenv
+pymupdf
+tiktoken
+openai
+pinecone-client

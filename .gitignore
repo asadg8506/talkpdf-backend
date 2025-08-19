@@ -1,0 +1,12 @@
+# Ignore environment file with API keys
+.env
+
+# Ignore Python cache files
+__pycache__/
+
+# Ignore virtual environment folders
+venv/
+claude-env/
+
+# Ignore log files
+*.log
