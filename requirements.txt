@@ -3,5 +3,5 @@ python-dotenv
 pymupdf
 tiktoken
 openai
-pinecone-client
+pinecone
 gunicorn
