@@ -4,3 +4,4 @@ pymupdf
 tiktoken
 openai
 pinecone-client
+gunicorn
