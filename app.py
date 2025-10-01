@@ -1,4 +1,6 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify
+
+from supabase import create_client
 import os
 from dotenv import load_dotenv
 import fitz  # PyMuPDF
@@ -15,6 +17,11 @@ app = Flask(__name__)
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_ENV = os.getenv("PINECONE_ENV")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+# Create supabase client
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Initialize Pinecone
 pc = Pinecone(api_key=PINECONE_KEY)
@@ -29,9 +36,9 @@ if index_name not in pc.list_indexes().names():
         metric="cosine",
         spec=ServerlessSpec(cloud="aws", region=PINECONE_ENV)
     )
-    print(f"✅ Index '{index_name}' created!")
+    print(f" Index '{index_name}' created!")
 else:
-    print(f"ℹ️ Index '{index_name}' already exists.")
+    print(f" Index '{index_name}' already exists.")
 
 index = pc.Index(index_name)
 
@@ -41,7 +48,7 @@ client = OpenAI(api_key=OPENAI_KEY)
 @app.route('/upload', methods=['POST'])
 def upload_file():
     if 'pdf' not in request.files:
-        return '❌ No file uploaded.', 400
+        return ' No file uploaded.', 400
 
     file = request.files['pdf']
     if file.filename.endswith('.pdf'):
@@ -60,12 +67,12 @@ def upload_file():
         index.upsert(vectors=vectors)
 
         return {
-            "message": f"✅ '{file.filename}' uploaded & stored in Pinecone.",
+            "message": f" '{file.filename}' uploaded & stored in Pinecone.",
             "text_length": len(text),
             "chunks": len(chunks),
             "pinecone_index": index_name
         }
-    return '❌ Invalid file. Only PDF allowed.', 400
+    return ' Invalid file. Only PDF allowed.', 400
 
 def extract_text_from_pdf(pdf_path):
     doc = fitz.open(pdf_path)
@@ -103,9 +110,67 @@ def ask_question():
     )
     return {"question": question, "answer": response.choices[0].message.content.strip()}
 
+
+@app.route('/signup', methods=['POST'])
+def signup():
+    data = request.json  
+    f_name = data.get("f_name")
+    l_name = data.get("l_name")
+    email = data.get("email")
+    password = data.get("password")
+
+    if not f_name or not l_name or not email or not password :
+        return jsonify({"error" : "all fields are required"}) , 400
+    
+    try:
+        response = supabase.table("users").insert({
+         "f_name": f_name,
+         "l_name": l_name,
+         "email": email,
+         "password": password
+        }).execute()
+
+    
+        return jsonify({"message": "User signed up successfully", "data": response.data}), 201
+
+    except Exception as e:
+        if "duplicate key value violates unique constraint" in str(e):
+           return jsonify({"error": "Email already exists"}), 400
+        return jsonify({"error": str(e)}), 500
+    
+
+
+
+
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+
+    email = data.get("email")
+    password = data.get("password")
+
+    if not email or not password:
+        return jsonify({"error": "Email and password required"}), 400
+
+    try:
+        response = supabase.table("users").select("*").eq("email", email).eq("password", password).execute()
+
+        if response.data:
+            return jsonify({"message": "Login successful", "user": response.data[0]}), 200
+        else:
+            return jsonify({"error": "Invalid email or password"}), 401
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
 @app.route('/')
 def home():
-    return "✅ API is running. Use /upload to store PDFs and /ask to query them."
+    return " API is running. Use /upload to store PDFs and /ask to query them."
+
+
 
 if __name__ == '__main__':
     app.run(debug=True)
