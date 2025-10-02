@@ -10,3 +10,5 @@ claude-env/
 
 # Ignore log files
 *.log
+
+uploads/
