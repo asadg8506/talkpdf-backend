@@ -1,3 +1,4 @@
+from flask_cors import CORS
 from flask import Flask, request, jsonify
 import bcrypt
 from supabase import create_client
@@ -7,11 +8,16 @@ import fitz  # PyMuPDF
 import tiktoken
 from openai import OpenAI
 from pinecone import Pinecone, ServerlessSpec
+from flask_jwt_extended import (
+    JWTManager, create_access_token, create_refresh_token,
+    jwt_required, get_jwt_identity, get_jwt )
+
 
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
+
 
 # Read keys from .env
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
@@ -19,6 +25,16 @@ PINECONE_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_ENV = os.getenv("PINECONE_ENV")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+FRONTEND_URL = os.getenv("FRONTEND_URL")
+CORS(app, origins=FRONTEND_URL, supports_credentials=True)
+
+
+app.config["JWT_SECRET_KEY"] = "super-secret-key"  # Secret key for JWT signing
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = 360       # 6 minutes
+app.config["JWT_REFRESH_TOKEN_EXPIRES"] = 604800   # 7 days
+jwt = JWTManager(app)
+BLOCKLIST = set()
+
 
 # Create supabase client
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -122,12 +138,15 @@ def signup():
     if not f_name or not l_name or not email or not password :
         return jsonify({"error" : "all fields are required"}) , 400
     
+    hashed_pw = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    
+         
     try:
         response = supabase.table("users").insert({
          "f_name": f_name,
          "l_name": l_name,
          "email": email,
-         "password": password
+         "password": hashed_pw
         }).execute()
 
     
@@ -138,9 +157,6 @@ def signup():
            return jsonify({"error": "Email already exists"}), 400
         return jsonify({"error": str(e)}), 500
     
-
-
-
 
 
 @app.route('/login', methods=['POST'])
@@ -154,15 +170,70 @@ def login():
         return jsonify({"error": "Email and password required"}), 400
 
     try:
-        response = supabase.table("users").select("*").eq("email", email).eq("password", password).execute()
+        # 1. Get user by email
+        response = supabase.table("users").select("*").eq("email", email).execute()
 
-        if response.data:
-            return jsonify({"message": "Login successful", "user": response.data[0]}), 200
+        if not response.data:  # Agar user nahi mila
+            return jsonify({"error": "User not found"}), 404
+
+        user_data = response.data[0]
+        stored_hashed_pw = user_data["password"].encode("utf-8")
+
+        # 2. Verify password
+        if bcrypt.checkpw(password.encode("utf-8"), stored_hashed_pw):
+            access_token = create_access_token(identity=email)
+            refresh_token = create_refresh_token(identity=email)
+
+            return jsonify({
+                "message": "Login successful",
+                "access_token": access_token,
+                "refresh_token": refresh_token
+            }), 200
         else:
-            return jsonify({"error": "Invalid email or password"}), 401
+            return jsonify({"error": "Invalid password"}), 401
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+
+
+
+@app.route('/profile', methods=['GET'])
+@jwt_required()  
+def profile():
+    current_user = get_jwt_identity()
+    return jsonify({
+        "message": f"Welcome {current_user}! Access token is valid."
+    }), 200
+
+
+
+
+@app.route('/refresh', methods=['POST'])
+@jwt_required(refresh=True)  
+def refresh():
+    current_user = get_jwt_identity()
+    new_access_token = create_access_token(identity=current_user)
+    return jsonify({
+        "message": "New access token generated successfully!",
+        "access_token": new_access_token
+    }), 200
+
+
+
+@jwt.token_in_blocklist_loader
+def check_if_token_revoked(jwt_header, jwt_payload):
+    return jwt_payload["jti"] in BLOCKLIST
+
+@app.route('/logout', methods=['POST'])
+@jwt_required()
+def logout():
+    current_user = get_jwt_identity()
+    jti= get_jwt()["jti"]
+    BLOCKLIST.add(jti)
+    return jsonify({"message" : "successfully logout"}), 200
+
+
 
 
 
@@ -171,6 +242,6 @@ def home():
     return " API is running. Use /upload to store PDFs and /ask to query them."
 
 
-
 if __name__ == '__main__':
     app.run(debug=True)
+
