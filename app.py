@@ -61,70 +61,120 @@ index = pc.Index(index_name)
 # OpenAI client
 client = OpenAI(api_key=OPENAI_KEY)
 
+
 @app.route('/upload', methods=['POST'])
+@jwt_required()
 def upload_file():
+
+    email = get_jwt_identity()
+
     if 'pdf' not in request.files:
-        return ' No file uploaded.', 400
+        return 'No file uploaded.', 400
 
     file = request.files['pdf']
+
     if file.filename.endswith('.pdf'):
+
         file_path = os.path.join('uploads', file.filename)
+
         os.makedirs('uploads', exist_ok=True)
+
         file.save(file_path)
 
         text = extract_text_from_pdf(file_path)
+
         chunks = chunk_text(text)
+
         embeddings = get_openai_embeddings(chunks)
 
         vectors = [
             (f"{file.filename}-chunk-{i}", embeddings[i], {"text": chunks[i]})
             for i in range(len(embeddings))
         ]
-        index.upsert(vectors=vectors)
+
+        # 🔹 store in Pinecone namespace
+        index.upsert(
+            vectors=vectors,
+            namespace=email
+        )
+
+        # 🔹 save pdf record in Supabase
+        supabase.table("pdf_files").insert({
+            "user_email": email,
+            "file_name": file.filename
+        }).execute()
 
         return {
-            "message": f" '{file.filename}' uploaded & stored in Pinecone.",
-            "text_length": len(text),
-            "chunks": len(chunks),
-            "pinecone_index": index_name
+            "message": f"{file.filename} uploaded successfully",
+            "chunks": len(chunks)
         }
-    return ' Invalid file. Only PDF allowed.', 400
 
-def extract_text_from_pdf(pdf_path):
-    doc = fitz.open(pdf_path)
-    return "\n".join([page.get_text() for page in doc])
+    return "Invalid file. Only PDF allowed.", 400
 
-def chunk_text(text, max_tokens=800):
-    tokenizer = tiktoken.encoding_for_model("text-embedding-ada-002")
-    tokens = tokenizer.encode(text)
-    return [tokenizer.decode(tokens[i:i+max_tokens]) for i in range(0, len(tokens), max_tokens)]
 
-def get_openai_embeddings(texts):
-    response = client.embeddings.create(model="text-embedding-ada-002", input=texts)
-    return [res.embedding for res in response.data]
 
 @app.route('/ask', methods=['POST'])
+@jwt_required()
 def ask_question():
+
+    email = get_jwt_identity()
     question = request.data.decode('utf-8').strip()
+
     if not question:
         return {"error": "No question provided."}, 400
-
+    
     question_embedding = get_openai_embeddings([question])[0]
-    search_response = index.query(vector=question_embedding, top_k=3, include_metadata=True)
+    search_response = index.query(
+        vector=question_embedding,
+        top_k=3,
+        include_metadata=True,
+        namespace=email 
+    )
     top_chunks = [match.metadata['text'] for match in search_response.matches]
-
+    
     if not top_chunks:
         return {"error": "No relevant data found in Pinecone."}, 404
-
     context = "\n\n---\n\n".join(top_chunks)
     response = client.chat.completions.create(
         model="gpt-3.5-turbo",
         messages=[
-            {"role": "system", "content": "You are a helpful assistant. Answer the question using only the given context."},
-            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"}
-        ]
-    )
-    return {"question": question, "answer": response.choices[0].message.content.strip()}
+            {
+                "role": "system",
+                "content": "You are a helpful assistant. Answer the question using only the given context."
+            },
+            {
+                "role": "user",
+                "content": f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
+            }])
+
+    answer = response.choices[0].message.content.strip()
+    supabase.table("chat_history").insert({
+        "user_email": email,
+        "question": question,
+        "answer": answer
+    }).execute()
+
+    return {
+        "question": question,
+        "answer": answer
+    }
+
+
+
+@app.route('/history', methods=['GET'])
+@jwt_required()
+def history():
+
+    email = get_jwt_identity()
+
+    response = supabase.table("chat_history") \
+        .select("*") \
+        .eq("user_email", email) \
+        .order("created_at", desc=True) \
+        .execute()
+
+    return jsonify(response.data)
+
 
 
 @app.route('/signup', methods=['POST'])
@@ -197,7 +247,6 @@ def login():
     
 
 
-
 @app.route('/profile', methods=['GET'])
 @jwt_required()  
 def profile():
@@ -205,7 +254,6 @@ def profile():
     return jsonify({
         "message": f"Welcome {current_user}! Access token is valid."
     }), 200
-
 
 
 
@@ -221,9 +269,79 @@ def refresh():
 
 
 
+@app.route('/forgot-password' , methods=['POST'])
+def forgot_password():
+    data = request.get_json()
+    email = data.get ("email")
+
+    if not email:
+        return jsonify({"error" : "email required"}), 400
+    
+    try:
+        response = supabase.table("users").select("*").eq("email",email).execute()
+        if not response.data:
+          return jsonify({"error" : "user not found"}),404
+        
+        import uuid
+        token = str(uuid.uuid4())
+
+        from datetime import datetime, timedelta, timezone
+        expiry = datetime.now(timezone.utc) + timedelta(minutes=15)
+
+        supabase.table("users").update({ "reset_token" : token, "token_expiry" : expiry.isoformat()}).eq("email",email).execute()
+        
+        reset_link = f"http://localhost:5173/reset-password?token={token}"
+        print(" RESET LINK:",reset_link)
+
+        return jsonify({"message": "reset link sent", "reset_link":reset_link }), 200
+    
+    except Exception as e:
+        return jsonify({"error" : str(e)}), 500   
+
+
+
+@app.route('/reset-password' , methods=['POST'])
+def reset_password():
+    data=request.get_json()
+    token = data.get("token")
+    new_password = data.get("new_password")
+
+    if not token or not new_password:
+        return jsonify({"error": "all fields required"}), 400
+    
+    try:
+        response = supabase.table("users").select("*").eq("reset_token", token).execute()
+
+        if not response.data:
+            return jsonify({"error":"invalid token"}), 400
+        
+        user = response.data[0]
+        from datetime import datetime, timezone
+
+        expiry_time = user["token_expiry"]
+
+        if not expiry_time:
+           return jsonify({"error": "invalid token or used token"}), 400
+
+        if datetime.now(timezone.utc) > datetime.fromisoformat(expiry_time):
+           return jsonify({"error": "token expired"}), 400
+        
+        import bcrypt 
+        hashed_pw = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+        supabase.table("users").update({"password" : hashed_pw, "reset_token": None, "token_expiry": None}).eq("reset_token", token).execute()
+        return jsonify({"message" : "password reset successfully"}), 200
+    
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+
 @jwt.token_in_blocklist_loader
 def check_if_token_revoked(jwt_header, jwt_payload):
     return jwt_payload["jti"] in BLOCKLIST
+
+
 
 @app.route('/logout', methods=['POST'])
 @jwt_required()
@@ -235,11 +353,10 @@ def logout():
 
 
 
-
-
 @app.route('/')
 def home():
     return " API is running. Use /upload to store PDFs and /ask to query them."
+
 
 
 if __name__ == '__main__':
