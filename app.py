@@ -30,7 +30,7 @@ CORS(app, origins=FRONTEND_URL, supports_credentials=True)
 
 
 app.config["JWT_SECRET_KEY"] = "super-secret-key"  # Secret key for JWT signing
-app.config["JWT_ACCESS_TOKEN_EXPIRES"] = 360       # 6 minutes
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = 1800       # 30 minutes
 app.config["JWT_REFRESH_TOKEN_EXPIRES"] = 604800   # 7 days
 jwt = JWTManager(app)
 BLOCKLIST = set()
@@ -56,17 +56,37 @@ if index_name not in pc.list_indexes().names():
 else:
     print(f" Index '{index_name}' already exists.")
 
+client = OpenAI(api_key=OPENAI_KEY)
 index = pc.Index(index_name)
 
-# OpenAI client
-client = OpenAI(api_key=OPENAI_KEY)
+def extract_text_from_pdf(pdf_path):
+     doc = fitz.open(pdf_path) 
+     return "\n".join([page.get_text() for page in doc]) 
+
+def chunk_text(text, max_tokens=800): 
+    tokenizer = tiktoken.encoding_for_model("text-embedding-ada-002") 
+    tokens = tokenizer.encode(text) 
+    return [tokenizer.decode(tokens[i:i+max_tokens]) 
+            for i in range(0, len(tokens), max_tokens)] 
+    
+def get_openai_embeddings(texts): 
+    response = client.embeddings.create(model="text-embedding-ada-002", input=texts) 
+    return [res.embedding for res in response.data]
+
 
 
 @app.route('/upload', methods=['POST'])
 @jwt_required()
 def upload_file():
-
+    
     email = get_jwt_identity()
+
+    user = supabase.table("users").select("user_id").eq("email", email).execute()
+
+    if not user.data:
+        return {"error": "User not found"}, 404
+
+    user_id = user.data[0]["user_id"]
 
     if 'pdf' not in request.files:
         return 'No file uploaded.', 400
@@ -74,17 +94,12 @@ def upload_file():
     file = request.files['pdf']
 
     if file.filename.endswith('.pdf'):
-
         file_path = os.path.join('uploads', file.filename)
-
         os.makedirs('uploads', exist_ok=True)
-
         file.save(file_path)
 
         text = extract_text_from_pdf(file_path)
-
         chunks = chunk_text(text)
-
         embeddings = get_openai_embeddings(chunks)
 
         vectors = [
@@ -92,15 +107,15 @@ def upload_file():
             for i in range(len(embeddings))
         ]
 
-        # 🔹 store in Pinecone namespace
+        #store in Pinecone namespace
         index.upsert(
             vectors=vectors,
             namespace=email
         )
 
-        # 🔹 save pdf record in Supabase
-        supabase.table("pdf_files").insert({
-            "user_email": email,
+        #save pdf record in Supabase
+        supabase.table("user_pdfs").insert({
+            "user_id": user_id,
             "file_name": file.filename
         }).execute()
 
