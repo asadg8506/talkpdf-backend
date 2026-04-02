@@ -17,11 +17,7 @@ from flask_jwt_extended import (
 load_dotenv()
 
 app = Flask(__name__)
-#CORS(app, supports_credentials=True)
-# CORS(app, origins=[
-#     "http://localhost:5173",
-#     "https://talkpdf-frontend.vercel.app"
-# ], supports_credentials=True)
+
 
 # Read keys from .env
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
@@ -30,9 +26,7 @@ PINECONE_ENV = os.getenv("PINECONE_ENV")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 FRONTEND_URL = os.getenv("FRONTEND_URL")
-CORS(app, origins=FRONTEND_URL, supports_credentials=True)
-#CORS(app, origins=["http://localhost:5173"], supports_credentials=True)
-
+CORS(app, origins=[os.getenv("FRONTEND_URL"), "http://localhost:5173"], supports_credentials=True)
 
 app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = 1800       # 30 minutes
