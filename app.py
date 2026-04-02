@@ -26,10 +26,10 @@ PINECONE_ENV = os.getenv("PINECONE_ENV")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 FRONTEND_URL = os.getenv("FRONTEND_URL")
-CORS(app, origins=FRONTEND_URL, supports_credentials=True)
+#CORS(app, origins=FRONTEND_URL, supports_credentials=True)
+CORS(app, origins=["http://localhost:5173"], supports_credentials=True)
 
-
-app.config["JWT_SECRET_KEY"] = "super-secret-key"  # Secret key for JWT signing
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = 1800       # 30 minutes
 app.config["JWT_REFRESH_TOKEN_EXPIRES"] = 604800   # 7 days
 jwt = JWTManager(app)
