@@ -17,7 +17,7 @@ from flask_jwt_extended import (
 load_dotenv()
 
 app = Flask(__name__)
-
+CORS(app, supports_credentials=True)
 
 # Read keys from .env
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
