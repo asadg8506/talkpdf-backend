@@ -3,6 +3,7 @@ from flask import Flask, request, jsonify
 import bcrypt
 from supabase import create_client
 import os
+import uuid
 from dotenv import load_dotenv
 import fitz  # PyMuPDF
 import tiktoken
@@ -26,10 +27,10 @@ PINECONE_ENV = os.getenv("PINECONE_ENV")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 FRONTEND_URL = os.getenv("FRONTEND_URL")
-CORS(app, origins=[os.getenv("FRONTEND_URL"), "http://localhost:5173"], supports_credentials=True)
+CORS(app, origins=[FRONTEND_URL, "http://localhost:5173"], supports_credentials=True)
 
 app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
-app.config["JWT_ACCESS_TOKEN_EXPIRES"] = 1800       # 30 minutes
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = 3600       # 1 hour
 app.config["JWT_REFRESH_TOKEN_EXPIRES"] = 604800   # 7 days
 jwt = JWTManager(app)
 BLOCKLIST = set()
@@ -79,7 +80,6 @@ def get_openai_embeddings(texts):
 def upload_file():
     
     email = get_jwt_identity()
-
     user = supabase.table("users").select("user_id").eq("email", email).execute()
 
     if not user.data:
@@ -97,29 +97,36 @@ def upload_file():
         os.makedirs('uploads', exist_ok=True)
         file.save(file_path)
 
+        doc = supabase.table("user_pdfs").insert({
+            "user_id": user_id,
+            "file_name": file.filename
+        }).execute()
+
+        doc_id = doc.data[0]["doc_id"]   
         text = extract_text_from_pdf(file_path)
         chunks = chunk_text(text)
         embeddings = get_openai_embeddings(chunks)
-
         vectors = [
-            (f"{file.filename}-chunk-{i}", embeddings[i], {"text": chunks[i]})
+            (
+                f"{doc_id}-chunk-{i}",  
+                embeddings[i],
+                {
+                    "text": chunks[i],
+                    "user_id": user_id,
+                    "doc_id": doc_id
+                }
+            )
             for i in range(len(embeddings))
         ]
 
-        #store in Pinecone namespace
         index.upsert(
             vectors=vectors,
             namespace=email
         )
 
-        #save pdf record in Supabase
-        supabase.table("user_pdfs").insert({
-            "user_id": user_id,
-            "file_name": file.filename
-        }).execute()
-
         return {
             "message": f"{file.filename} uploaded successfully",
+            "doc_id": doc_id,  
             "chunks": len(chunks)
         }
 
@@ -132,38 +139,90 @@ def upload_file():
 def ask_question():
 
     email = get_jwt_identity()
-    question = request.data.decode('utf-8').strip()
+    data = request.get_json()
+    question = data.get("question")
+    doc_id = data.get("doc_id")
+    conversation_id = data.get("conversation_id")
 
     if not question:
         return {"error": "No question provided."}, 400
-    
+
+    if not doc_id:
+        return {"error": "doc_id is required"}, 400
+
+    if not conversation_id:
+        return {"error": "conversation_id is required"}, 400
+
+    user = supabase.table("users").select("user_id").eq("email", email).execute()
+    user_id = user.data[0]["user_id"]
     question_embedding = get_openai_embeddings([question])[0]
+
     search_response = index.query(
         vector=question_embedding,
         top_k=3,
         include_metadata=True,
-        namespace=email 
+        namespace=email,
+        filter={
+            "doc_id": doc_id,
+            "user_id": user_id
+        }
     )
-    top_chunks = [match.metadata['text'] for match in search_response.matches]
-    
+
+    top_chunks = [
+        match["metadata"]["text"]
+        for match in search_response["matches"]
+    ]
+
     if not top_chunks:
-        return {"error": "No relevant data found in Pinecone."}, 404
+        return {"error": "No relevant data found in this PDF."}, 404
+
     context = "\n\n---\n\n".join(top_chunks)
+
+    history = supabase.table("chat_history") \
+        .select("question, answer") \
+        .eq("conversation_id", conversation_id) \
+        .order("created_at", desc=False) \
+        .execute()
+
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful assistant. Answer only from given context."
+        }
+    ]
+
+    for chat in history.data:
+        messages.append({
+            "role": "user",
+            "content": chat["question"]
+        })
+        messages.append({
+            "role": "assistant",
+            "content": chat["answer"]
+        })
+
+    messages.append({
+        "role": "user",
+        "content": f"Context:\n{context}\n\nQuestion: {question}"
+    })
+
     response = client.chat.completions.create(
         model="gpt-3.5-turbo",
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a helpful assistant. Answer the question using only the given context."
-            },
-            {
-                "role": "user",
-                "content": f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
-            }])
+        messages=messages
+    )
 
     answer = response.choices[0].message.content.strip()
+
+    if len(history.data) == 0:
+        supabase.table("conversations") \
+            .update({"title": question[:30]}) \
+            .eq("id", conversation_id) \
+            .execute()
+
+
     supabase.table("chat_history").insert({
-        "user_email": email,
+        "doc_id": doc_id,
+        "conversation_id": conversation_id,
         "question": question,
         "answer": answer
     }).execute()
@@ -257,6 +316,7 @@ def login():
             return jsonify({"error": "Invalid password"}), 401
 
     except Exception as e:
+        print("LOGIN ERROR:", str(e))
         return jsonify({"error": str(e)}), 500
     
 
@@ -364,6 +424,129 @@ def logout():
     jti= get_jwt()["jti"]
     BLOCKLIST.add(jti)
     return jsonify({"message" : "successfully logout"}), 200
+
+
+
+@app.route("/conversation/start", methods=["POST"])
+@jwt_required()
+def start_conversation():
+
+    email = get_jwt_identity()
+    data = request.get_json()
+    doc_id = data.get("doc_id")
+
+    user = supabase.table("users") \
+        .select("user_id") \
+        .eq("email", email) \
+        .execute()
+
+    user_id = user.data[0]["user_id"]
+
+    response = supabase.table("conversations").insert({
+        "user_id": user_id,
+        "doc_id": doc_id,
+        "title": "New Chat"
+    }).execute()
+
+    return {
+        "message": "Conversation started",
+        "conversation_id": response.data[0]["id"]
+    }
+
+
+
+@app.route("/pdfs", methods=["GET"])
+@jwt_required()
+def get_pdfs():
+    email = get_jwt_identity()
+    user = supabase.table("users").select("user_id").eq("email", email).execute()
+    user_id = user.data[0]["user_id"]
+
+    docs = supabase.table("user_pdfs") \
+        .select("*") \
+        .eq("user_id", user_id) \
+        .execute()
+
+    return jsonify(docs.data), 200
+
+
+
+@app.route("/pdfs/<doc_id>", methods=["DELETE"])
+@jwt_required()
+def delete_pdf(doc_id):
+    email = get_jwt_identity()
+    user = supabase.table("users").select("user_id").eq("email", email).execute()
+    user_id = user.data[0]["user_id"]
+
+    supabase.table("user_pdfs") \
+        .delete() \
+        .eq("doc_id", doc_id) \
+        .eq("user_id", user_id) \
+        .execute()
+
+    index.delete(
+        filter={
+            "doc_id": doc_id,
+            "user_id": user_id
+        }
+    )
+
+    return jsonify({"message": "PDF deleted"}), 200
+
+
+
+@app.route("/pdfs/<doc_id>", methods=["PUT"])
+@jwt_required()
+def rename_pdf(doc_id):
+    email = get_jwt_identity()
+    user = supabase.table("users").select("user_id").eq("email", email).execute()
+    user_id = user.data[0]["user_id"]
+    data = request.get_json()
+    new_name = data.get("file_name")
+
+    supabase.table("user_pdfs") \
+        .update({"file_name": new_name}) \
+        .eq("doc_id", doc_id) \
+        .eq("user_id", user_id) \
+        .execute()
+
+    return jsonify({"message": "Renamed successfully"}), 200
+
+
+
+@app.route("/conversations", methods=["GET"])
+@jwt_required()
+def get_conversations():
+
+    email = get_jwt_identity()
+
+    user = supabase.table("users") \
+        .select("user_id") \
+        .eq("email", email) \
+        .execute()
+
+    user_id = user.data[0]["user_id"]
+
+    response = supabase.table("conversations") \
+        .select("*") \
+        .eq("user_id", user_id) \
+        .order("created_at", desc=True) \
+        .execute()
+
+    return jsonify(response.data)
+
+
+
+@app.route("/conversations/<conversation_id>", methods=["GET"])
+@jwt_required()
+def get_conversation_messages(conversation_id):
+    response = supabase.table("chat_history") \
+        .select("*") \
+        .eq("conversation_id", conversation_id) \
+        .order("created_at", desc=False) \
+        .execute()
+
+    return jsonify(response.data)
 
 
 
